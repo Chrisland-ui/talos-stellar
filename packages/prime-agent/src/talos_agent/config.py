@@ -310,6 +310,24 @@ class Settings(BaseSettings):
         description="Maximum seconds for a single external tool call before it is cancelled.",
     )
 
+    # MCP server (Issue #972) — optional tool exposure over stdio
+    mcp_allowlist_extra: str = Field(
+        default="",
+        validation_alias="TALOS_MCP_ALLOWLIST_EXTRA",
+        description=(
+            "Comma-separated tool names to expose via the MCP server "
+            "in addition to the default read-only allowlist."
+        ),
+    )
+    mcp_allowlist_only: str = Field(
+        default="",
+        validation_alias="TALOS_MCP_ALLOWLIST_ONLY",
+        description=(
+            "Comma-separated tool names; when set, the MCP server "
+            "exposes ONLY these tools, overriding the default allowlist."
+        ),
+    )
+
     # Job leasing
     job_lease_ttl: int = Field(
         default=300,
