@@ -411,6 +411,7 @@ def build_all_tools(
 
     # Inject dependencies into tool modules
     _internal_mod._db = db
+    _internal_mod._settings = settings
     _web_api_mod._api = api
     _web_api_mod._settings = settings
     _browser_mod._browser = browser
