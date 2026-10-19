@@ -35,6 +35,12 @@ pnpm test:payment-coverage
 cd web && pnpm vitest run tests/activity.test.ts tests/activity-pagination.test.ts
 ```
 
+### Security-header regression check
+
+```bash
+pnpm test:security-headers
+```
+
 ## Getting Started
 
 First, run the development server:
@@ -100,7 +106,7 @@ If a versioned deployment causes issues:
 
 1. Revert the code changes to the route handlers while keeping the middleware and version config in place.
 2. Deploy the revert.
-3. If the middleware itself is the issue, remove `src/middleware.ts` and restore the original `src/proxy.ts` — unversioned routes continue to work without the middleware.
+3. If the proxy itself is the issue, revert `src/proxy.ts` and its related configuration. Unversioned routes continue to work without version negotiation.
 
 ## OpenAPI Contract
 
@@ -126,6 +132,10 @@ CI runs the same snapshot test and fails if `/api/docs/openapi.json` differs fro
 ## Transactional Outbox
 
 A durable, Postgres-backed outbox so a domain mutation and the event describing it can never diverge (atomic write, lease-based dispatch, retry/backoff, retention). Disabled by default (`OUTBOX_ENABLED=false`). See **[OUTBOX.md](./OUTBOX.md)**.
+
+## Stellar Payment Reconciler
+
+A background reconciler and finality state machine that verifies submitted Stellar payment transactions against Horizon, applies idempotent downstream repairs to commerce jobs and token purchases, and provides operator inspection endpoints. Disabled by default (`RECONCILER_ENABLED=false`). See **[RECONCILER.md](./RECONCILER.md)**.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 

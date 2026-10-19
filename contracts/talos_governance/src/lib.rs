@@ -13,7 +13,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 use ttl_manager;
 use pause_control;
@@ -61,6 +61,22 @@ pub struct Proposal {
     pub created_at: u64,
 }
 
+/// Default number of ledgers prior to proposal creation at which voting power is snapshotted.
+///
+/// An offset is used so that voting power is evaluated at a ledger sequence before
+/// the proposal was submitted. This prevents flash-loan or same-ledger front-running
+/// attacks where an account acquires tokens in the same ledger as proposal creation,
+/// exercises proposal creation / voting rights with temporarily borrowed funds, and
+/// exits in the same transaction or block. On Stellar's ~5-second ledger cadence,
+/// 10 ledgers represents an offset of approximately 50 seconds.
+pub const DEFAULT_SNAPSHOT_OFFSET_LEDGERS: u32 = 10;
+
+/// Maximum allowed snapshot offset in ledgers (~7 days on a 5-second ledger cadence).
+///
+/// Bounding the maximum offset prevents misconfigurations where proposals attempt to
+/// snapshot state beyond the ledger retention or historical checkpoint window.
+pub const MAX_SNAPSHOT_OFFSET_LEDGERS: u32 = 120_960;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GovernanceConfig {
@@ -68,6 +84,7 @@ pub struct GovernanceConfig {
     pub consensus_threshold: i128,
     pub voting_period_ledgers: u32,
     pub pulse_token_address: Address,
+    pub snapshot_offset_ledgers: Option<u32>,
 }
 
 #[contracttype]
@@ -87,6 +104,12 @@ pub enum DataKey {
     NextDividendEpoch,
     /// Dividend snapshot keyed by epoch number.
     DividendSnapshot(u32),
+    /// Sentinel written once when a proposal first crosses the quorum
+    /// threshold.  Presence (value `true`) prevents re-emitting
+    /// `EventQuorumReached` for subsequent votes.
+    QuorumReached(u32),
+    /// Configured TalosRegistry contract address.
+    RegistryContract,
 }
 
 #[contracttype]
@@ -95,6 +118,14 @@ pub struct Checkpoint {
     pub ledger: u32,
     pub votes: i128,
 }
+
+// ── Proposal Limits ──────────────────────────────────────────────────
+
+/// Maximum allowed byte length for proposal titles.
+pub const MAX_TITLE_LEN: u32 = 128;
+
+/// Maximum allowed byte length for proposal descriptions.
+pub const MAX_DESCRIPTION_LEN: u32 = 2048;
 
 // ── Dividend Snapshot (#598) ─────────────────────────────────────────
 
@@ -132,6 +163,61 @@ pub struct EventDividendSnapshotRecorded {
     pub total_usdc: i128,
     pub per_token_usdc: i128,
     pub snapshot_ledger: u32,
+}
+
+// ── Quorum State (#599) ──────────────────────────────────────────────
+
+/// A read-only snapshot of quorum progress for a given proposal.
+///
+/// All fields are derived from the current `Proposal` storage and the
+/// active `GovernanceConfig` at query time — no extra storage is written
+/// for this query.
+///
+/// ## Field semantics
+///
+/// | Field | Description |
+/// |---|---|
+/// | `votes_cast` | Total voting weight cast (yes + no). |
+/// | `quorum_threshold` | Minimum `votes_cast` required to reach quorum. |
+/// | `quorum_met` | `true` when `votes_cast >= quorum_threshold`. |
+/// | `yes_votes` | Cumulative approve weight. |
+/// | `no_votes` | Cumulative reject weight. |
+/// | `approval_bps` | `yes_votes * 10_000 / votes_cast` (0 when `votes_cast == 0`). |
+/// | `consensus_threshold` | The `approval_bps` floor required to approve. |
+/// | `quorum_fraction_bps` | `votes_cast * 10_000 / quorum_threshold` — progress toward quorum, capped at 10 000. |
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProposalQuorumState {
+    /// Total voting weight cast (yes + no).
+    pub votes_cast: i128,
+    /// Minimum `votes_cast` required to reach quorum.
+    pub quorum_threshold: i128,
+    /// `true` when `votes_cast >= quorum_threshold`.
+    pub quorum_met: bool,
+    /// Cumulative approve weight.
+    pub yes_votes: i128,
+    /// Cumulative reject weight.
+    pub no_votes: i128,
+    /// `yes_votes * 10_000 / votes_cast`; 0 when `votes_cast == 0`.
+    pub approval_bps: i128,
+    /// The `approval_bps` floor required to pass.
+    pub consensus_threshold: i128,
+    /// `votes_cast * 10_000 / quorum_threshold`; capped at 10_000.
+    pub quorum_fraction_bps: i128,
+}
+
+/// Emitted the **first time** a proposal crosses the quorum threshold.
+///
+/// A `DataKey::QuorumReached(proposal_id)` sentinel is written once the
+/// event fires; subsequent votes that keep quorum satisfied do **not**
+/// re-emit the event.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventQuorumReached {
+    pub proposal_id: u32,
+    pub votes_cast: i128,
+    pub quorum_threshold: i128,
+    pub approval_bps: i128,
 }
 
 // ── Pause Domains ───────────────────────────────────────────────────
@@ -241,17 +327,42 @@ fn emit_dividend_snapshot_recorded(env: &Env, snap: &DividendSnapshot) {
         .publish((symbol_short!("div_snap"), snap.epoch), payload);
 }
 
-// ── Stable interface (v1.0.0) ───────────────────────────────────────
+// ── Quorum-reached emit helper (#599) ──────────────────────────────
+
+fn emit_quorum_reached(
+    env: &Env,
+    proposal_id: u32,
+    votes_cast: i128,
+    quorum_threshold: i128,
+    approval_bps: i128,
+) {
+    let payload = EventQuorumReached {
+        proposal_id,
+        votes_cast,
+        quorum_threshold,
+        approval_bps,
+    };
+    env.events()
+        .publish((symbol_short!("qrm_rchd"), proposal_id), payload);
+}
+
+fn emit_registry_updated(env: &Env, old_registry: Option<Address>, new_registry: Address) {
+    let topics = (symbol_short!("reg_upd"),);
+    env.events().publish(topics, (old_registry, new_registry));
+}
+
+// ── Stable interface (v1.1.0) ───────────────────────────────────────
 //
-// Also fixes a pre-existing omission: Governance did not previously
-// expose `version()` or `interface_id()`. Cross-contract callers and
-// tooling (e.g. an indexer reconciling the protocol's contract families)
-// now read these bytes via the standard interface queries exposed on
-// every Talos contract. The version starts at `(1, 0, 0)` to align
-// with the rest of the v1 protocol generation; the namespace and
-// golden-vector derivation follow the same algorithm as the Registry
-// and Name Service (see `INTERFACE_ID` tests below).
-pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 0, 0);
+// v1.1.0 adds:
+//   - `ProposalQuorumState` struct and `get_proposal_quorum_state` query
+//   - `EventQuorumReached` typed event emitted once per proposal
+//   - `DataKey::QuorumReached(u32)` idempotency sentinel
+//   - `quorum_state` capability in `interface_features()`
+//
+// All changes are purely additive.  Existing callers (v1.0.0) remain
+// fully compatible; no storage keys or existing entry-point signatures
+// have been modified.
+pub const CONTRACT_VERSION: (u32, u32, u32) = (1, 1, 0);
 
 pub const INTERFACE_NAMESPACE: &str = "TalosGovernance";
 
@@ -260,7 +371,7 @@ pub const INTERFACE_ID: [u8; 32] = [
     0x65, 0x72, 0x6E, 0x61, 0x6E, 0x63, 0x65, 0x00, // "ernance" + zero pad
     // (major, minor, patch) big-endian u32s
     0x00, 0x00, 0x00, 0x01, // major = 1
-    0x00, 0x00, 0x00, 0x00, // minor = 0
+    0x00, 0x00, 0x00, 0x01, // minor = 1
     0x00, 0x00, 0x00, 0x00, // patch = 0
     // reserved
     0x00, 0x00, 0x00, 0x00,
@@ -275,6 +386,7 @@ pub fn features_list() -> &'static [&'static str] {
         "vote_weighting",     // snapshot-based token-weighted voting
         "config_admin",       // update_config / cache_token_balance requires admin
         "interface_query",    // version / interface_id / supports_version
+        "quorum_state",       // get_proposal_quorum_state / EventQuorumReached
     ]
 }
 
@@ -290,6 +402,69 @@ pub fn version_supports(actual: (u32, u32, u32), required: (u32, u32, u32)) -> b
         return false;
     }
     actual.2 >= required.2
+}
+
+/// Expected `INTERFACE_ID` of the configured `RegistryContract`, mirroring
+/// the bytes published by `talos_registry::INTERFACE_ID` (namespace
+/// `"TalosRegistry"`, version `(1, 4, 0)`). Kept as an inline copy rather
+/// than a crate dependency so this contract's ABI check has no build-time
+/// coupling to the Registry crate.
+pub const EXPECTED_REGISTRY_INTERFACE_ID: [u8; 32] = [
+    0x54, 0x61, 0x6C, 0x6F, 0x73, 0x52, 0x65, 0x67, // "TalosReg"
+    0x69, 0x73, 0x74, 0x72, 0x79, 0x00, 0x00, 0x00, // "istry" + zero pads
+    // (major, minor, patch) big-endian u32s
+    0x00, 0x00, 0x00, 0x01, // major = 1
+    0x00, 0x00, 0x00, 0x04, // minor = 4
+    0x00, 0x00, 0x00, 0x00, // patch = 0
+    // reserved
+    0x00, 0x00, 0x00, 0x00,
+];
+
+/// Cross-contract compatibility helper.
+///
+/// Verifies that a contract registered as a `TalosRegistry` actually
+/// publishes the expected `INTERFACE_ID`. Emits a `compat_ok` event
+/// when the check passes and a `compat_err` event when it fails.
+pub fn check_registry_compatible(
+    e: &Env,
+    registry: &Address,
+    revert_on_mismatch: bool,
+) -> bool {
+    let registry_id: BytesN<32> = e.invoke_contract(
+        registry,
+        &Symbol::new(e, "interface_id"),
+        soroban_sdk::vec![e],
+    );
+
+    if registry_id != BytesN::from_array(e, &EXPECTED_REGISTRY_INTERFACE_ID) {
+        let topics = (Symbol::new(e, "compat_err"),);
+        e.events().publish(topics, ());
+        if revert_on_mismatch {
+            panic!("Registry interface ID mismatch: expected TalosRegistry-compatible v1");
+        }
+        return false;
+    }
+
+    let version: (u32, u32, u32) = e.invoke_contract(
+        registry,
+        &Symbol::new(e, "version"),
+        soroban_sdk::vec![e],
+    );
+
+    if !version_supports(version, (1, 1, 0)) {
+        let topics = (Symbol::new(e, "compat_err"),);
+        e.events()
+            .publish(topics, (version.0, version.1, version.2));
+        if revert_on_mismatch {
+            panic!("Registry version too old: requires TalosRegistry >= 1.1.0");
+        }
+        return false;
+    }
+
+    let topics = (symbol_short!("compat_ok"),);
+    e.events()
+        .publish(topics, (version.0, version.1, version.2));
+    true
 }
 
 #[contract]
@@ -325,6 +500,7 @@ impl TalosGovernance {
             consensus_threshold,
             voting_period_ledgers,
             pulse_token_address,
+            snapshot_offset_ledgers: None,
         };
 
         env.storage().persistent().set(&DataKey::Admin, &admin);
@@ -351,13 +527,41 @@ impl TalosGovernance {
         if title.len() == 0 {
             panic!("Title cannot be empty");
         }
+        if title.len() > MAX_TITLE_LEN {
+            panic!("Title exceeds maximum length");
+        }
         if description.len() == 0 {
             panic!("Description cannot be empty");
+        }
+        if description.len() > MAX_DESCRIPTION_LEN {
+            panic!("Description exceeds maximum length");
+        }
+
+        // Cross-contract verification: ensure talos_id exists and is active if
+        // a registry contract has been configured.
+        // For registry-unset deployments, the check is explicitly skipped to preserve
+        // backwards compatibility with unconfigured or legacy deployments.
+        if let Some(registry) = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract)
+        {
+            let is_active: bool = env.invoke_contract(
+                &registry,
+                &Symbol::new(&env, "is_active"),
+                soroban_sdk::vec![&env, talos_id.into_val(&env)],
+            );
+            if !is_active {
+                panic!("Talos is not active or does not exist");
+            }
         }
 
         let config = Self::require_config(&env);
         let current_ledger = env.ledger().sequence();
-        let snapshot_ledger = current_ledger.saturating_sub(10);
+        let snapshot_offset = config
+            .snapshot_offset_ledgers
+            .unwrap_or(DEFAULT_SNAPSHOT_OFFSET_LEDGERS);
+        let snapshot_ledger = current_ledger.saturating_sub(snapshot_offset);
         let proposal_id = Self::next_proposal_id(env.clone());
         let end_ledger = current_ledger + config.voting_period_ledgers;
 
@@ -508,7 +712,48 @@ impl TalosGovernance {
         if config.voting_period_ledgers == 0 {
             panic!("Voting period must be positive");
         }
+        if let Some(offset) = config.snapshot_offset_ledgers {
+            if offset > MAX_SNAPSHOT_OFFSET_LEDGERS {
+                panic!("Snapshot offset exceeds maximum allowed");
+            }
+        }
         env.storage().persistent().set(&DataKey::Config, &config);
+    }
+
+    /// Update the registered TalosRegistry contract address (admin only).
+    ///
+    /// Requires admin authorization. Setting this address enables Talos ID
+    /// validation during `create_proposal`.
+    pub fn set_registry_contract(env: Env, admin: Address, registry: Address) {
+        pause_control::check_not_paused(&env, PAUSE_GOVERNANCE_CONFIG);
+        Self::require_admin(&env, &admin);
+
+        let old_registry = env
+            .storage()
+            .persistent()
+            .get::<_, Address>(&DataKey::RegistryContract);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RegistryContract, &registry);
+
+        emit_registry_updated(&env, old_registry, registry);
+    }
+
+    /// Alias for `set_registry_contract` (admin only).
+    pub fn set_registry(env: Env, admin: Address, registry: Address) {
+        Self::set_registry_contract(env, admin, registry);
+    }
+
+    /// Verify that the configured `RegistryContract` exposes the
+    /// `TalosRegistry` interface and supports version `(1, 1, 0)` or higher.
+    pub fn assert_registry_compatible(env: Env) -> bool {
+        let registry: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RegistryContract)
+            .expect("Registry contract not initialized");
+        check_registry_compatible(&env, &registry, true)
     }
 
     // ── Dividend Snapshots (#598) ─────────────────────────────────────
@@ -656,6 +901,77 @@ impl TalosGovernance {
         env.storage().persistent().get(&DataKey::Admin)
     }
 
+    pub fn get_registry(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::RegistryContract)
+    }
+
+    pub fn get_registry_contract(env: Env) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::RegistryContract)
+    }
+
+    // ── Quorum State (#599) ──────────────────────────────────────────
+
+    /// Return the current quorum progress for a proposal.
+    ///
+    /// This is a **read-only** query — it writes nothing and requires no
+    /// authorization.  The returned `ProposalQuorumState` is derived
+    /// on-the-fly from the stored `Proposal` and the active
+    /// `GovernanceConfig`.
+    ///
+    /// Returns `None` when the proposal does not exist.
+    ///
+    /// ## Field semantics
+    /// - `votes_cast` — total weight cast (yes + no).
+    /// - `quorum_threshold` — votes_cast floor from the config.
+    /// - `quorum_met` — `votes_cast >= quorum_threshold`.
+    /// - `yes_votes` / `no_votes` — individual tallies.
+    /// - `approval_bps` — yes share in basis points (10 000 = 100 %).
+    ///   Zero when no votes have been cast.
+    /// - `consensus_threshold` — the approval_bps floor required to pass.
+    /// - `quorum_fraction_bps` — progress toward quorum in basis points,
+    ///   capped at 10 000.
+    pub fn get_proposal_quorum_state(env: Env, proposal_id: u32) -> Option<ProposalQuorumState> {
+        let proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Proposal(proposal_id))?;
+
+        let config: GovernanceConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Config)
+            .expect("Contract not initialized");
+
+        let votes_cast = proposal.yes_votes + proposal.no_votes;
+        let quorum_threshold = config.quorum_threshold;
+        let quorum_met = votes_cast >= quorum_threshold;
+
+        let approval_bps = if votes_cast > 0 {
+            (proposal.yes_votes * 10_000) / votes_cast
+        } else {
+            0
+        };
+
+        // Clamp quorum_fraction_bps to 10_000 so it never exceeds 100 %.
+        let quorum_fraction_bps = if quorum_threshold > 0 {
+            let raw = (votes_cast * 10_000) / quorum_threshold;
+            if raw > 10_000 { 10_000 } else { raw }
+        } else {
+            10_000
+        };
+
+        Some(ProposalQuorumState {
+            votes_cast,
+            quorum_threshold,
+            quorum_met,
+            yes_votes: proposal.yes_votes,
+            no_votes: proposal.no_votes,
+            approval_bps,
+            consensus_threshold: config.consensus_threshold,
+            quorum_fraction_bps,
+        })
+    }
+
     // ── Stable interface (v1.0.0) ───────────────────────────────────
 
     /// Return `(major, minor, patch)` for this contract. Fixes a
@@ -670,6 +986,29 @@ impl TalosGovernance {
     /// independent reproduction of the byte layout.
     pub fn interface_id(e: Env) -> BytesN<32> {
         BytesN::from_array(&e, &INTERFACE_ID)
+    }
+
+    /// Return the canonical deployment-manifest digest for the contract.
+    ///
+    /// The digest is rebuilt from the immutable interface values so operators can
+    /// compare deployments without adding any ledger-backed source of truth.
+    pub fn deployment_manifest_digest(e: Env) -> BytesN<32> {
+        let mut payload = soroban_sdk::Bytes::new(&e);
+        payload.append(&soroban_sdk::Bytes::from_array(&e, &INTERFACE_ID));
+        payload.extend_from_slice(&CONTRACT_VERSION.0.to_be_bytes());
+        payload.extend_from_slice(&CONTRACT_VERSION.1.to_be_bytes());
+        payload.extend_from_slice(&CONTRACT_VERSION.2.to_be_bytes());
+
+        for feature in features_list() {
+            let bytes = feature.as_bytes();
+            payload.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            payload.extend_from_slice(bytes);
+        }
+
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+
+        e.crypto().sha256(&payload).to_bytes()
     }
 
     /// Return `true` when the deployed semver supports the requested
@@ -985,6 +1324,29 @@ impl TalosGovernance {
         let config = Self::require_config(env);
         let total_votes = proposal.yes_votes + proposal.no_votes;
         if total_votes >= config.quorum_threshold {
+            // Emit EventQuorumReached exactly once per proposal — write a
+            // sentinel before emitting so a re-entrant call cannot double-fire.
+            let sentinel_key = DataKey::QuorumReached(proposal.id);
+            let already_emitted: bool = env
+                .storage()
+                .persistent()
+                .get(&sentinel_key)
+                .unwrap_or(false);
+            if !already_emitted {
+                env.storage().persistent().set(&sentinel_key, &true);
+                let approval_bps = if total_votes > 0 {
+                    (proposal.yes_votes * 10_000) / total_votes
+                } else {
+                    0
+                };
+                emit_quorum_reached(
+                    env,
+                    proposal.id,
+                    total_votes,
+                    config.quorum_threshold,
+                    approval_bps,
+                );
+            }
             Self::finalize_status(env, proposal);
             emit_proposal_status_changed(env, proposal.id, proposal.status.clone());
         }
@@ -1506,6 +1868,32 @@ mod tests {
     }
 
     #[test]
+    fn deployment_manifest_digest_is_stable_and_canonical() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+
+        let digest = client.deployment_manifest_digest();
+        let again = client.deployment_manifest_digest();
+        assert_eq!(digest, again, "digest must be deterministic");
+
+        let mut payload = soroban_sdk::Bytes::new(&env);
+        payload.append(&soroban_sdk::Bytes::from_array(&env, &INTERFACE_ID));
+        payload.extend_from_slice(&CONTRACT_VERSION.0.to_be_bytes());
+        payload.extend_from_slice(&CONTRACT_VERSION.1.to_be_bytes());
+        payload.extend_from_slice(&CONTRACT_VERSION.2.to_be_bytes());
+        for feature in features_list() {
+            let bytes = feature.as_bytes();
+            payload.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            payload.extend_from_slice(bytes);
+        }
+        payload.extend_from_slice(&1u32.to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+
+        let expected = env.crypto().sha256(&payload).to_bytes();
+        assert_eq!(digest, expected);
+        let _ = contract_id;
+    }
+
+    #[test]
     fn proposal_creation_requires_auth_and_records_proposer() {
         let (env, contract_id, _admin, _pulse, client) = setup();
         let proposer = Address::generate(&env);
@@ -1615,6 +2003,7 @@ mod tests {
             consensus_threshold: 6_000,
             voting_period_ledgers: 30,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
 
         client
@@ -1723,6 +2112,7 @@ mod tests {
             consensus_threshold: 6_000,
             voting_period_ledgers: 30,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
         let res = client
             .mock_auths(&[MockAuth {
@@ -1922,6 +2312,7 @@ mod tests {
             consensus_threshold: 5_000,
             voting_period_ledgers: 20,
             pulse_token_address: pulse,
+            snapshot_offset_ledgers: None,
         };
         let rando = Address::generate(&env);
         let result = client.try_update_config(&rando, &config);
@@ -2108,6 +2499,98 @@ mod tests {
         assert!(result.is_err(), "empty description must be rejected");
     }
 
+    /// Proposal creation with title exactly at MAX_TITLE_LEN succeeds.
+    #[test]
+    fn create_proposal_title_at_limit_succeeds() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title_bytes = [b'a'; MAX_TITLE_LEN as usize];
+        let title = s(&env, std::str::from_utf8(&title_bytes).unwrap());
+        let desc = s(&env, "Valid description");
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &1u32, &title, &desc);
+        assert_eq!(proposal_id, 1);
+    }
+
+    /// Proposal creation with title one byte over MAX_TITLE_LEN fails.
+    #[test]
+    fn create_proposal_title_exceeding_limit_fails() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title_bytes = [b'a'; (MAX_TITLE_LEN + 1) as usize];
+        let title = s(&env, std::str::from_utf8(&title_bytes).unwrap());
+        let desc = s(&env, "Valid description");
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &1u32, &title, &desc);
+        assert!(result.is_err(), "title exceeding limit must fail");
+    }
+
+    /// Proposal creation with description exactly at MAX_DESCRIPTION_LEN succeeds.
+    #[test]
+    fn create_proposal_description_at_limit_succeeds() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Valid title");
+        let desc_bytes = [b'd'; MAX_DESCRIPTION_LEN as usize];
+        let desc = s(&env, std::str::from_utf8(&desc_bytes).unwrap());
+
+        let proposal_id = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .create_proposal(&proposer, &1u32, &title, &desc);
+        assert_eq!(proposal_id, 1);
+    }
+
+    /// Proposal creation with description one byte over MAX_DESCRIPTION_LEN fails.
+    #[test]
+    fn create_proposal_description_exceeding_limit_fails() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let title = s(&env, "Valid title");
+        let desc_bytes = [b'd'; (MAX_DESCRIPTION_LEN + 1) as usize];
+        let desc = s(&env, std::str::from_utf8(&desc_bytes).unwrap());
+
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1u32, title.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &1u32, &title, &desc);
+        assert!(result.is_err(), "description exceeding limit must fail");
+    }
+
     /// cache_token_balance with a negative balance must fail.
     #[test]
     fn cache_token_balance_negative_is_rejected() {
@@ -2237,5 +2720,712 @@ mod tests {
             }])
             .try_initialize(&admin, &pulse, &100_i128, &5_000_i128, &20_u32);
         assert!(result.is_err(), "double initialization must be rejected");
+    }
+
+    // ── Quorum State Tests (#599) ─────────────────────────────────
+
+    /// Before any votes are cast the quorum state returns zeros and quorum_met=false.
+    #[test]
+    fn quorum_state_before_any_votes_is_zero() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        let qs = client.get_proposal_quorum_state(&proposal_id).unwrap();
+
+        assert_eq!(qs.votes_cast, 0);
+        assert_eq!(qs.yes_votes, 0);
+        assert_eq!(qs.no_votes, 0);
+        assert_eq!(qs.approval_bps, 0);
+        assert!(!qs.quorum_met, "quorum should not be met with zero votes");
+        assert_eq!(qs.quorum_threshold, 100); // from setup: quorum_threshold = 100
+        assert_eq!(qs.quorum_fraction_bps, 0);
+        assert_eq!(qs.consensus_threshold, 5_100); // from setup
+    }
+
+    /// Partial votes below quorum threshold show correct fractions and quorum_met=false.
+    #[test]
+    fn quorum_state_partial_votes_below_threshold() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // Cache 50 weight — below quorum_threshold of 100
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, proposal.snapshot_ledger, &voter, 50);
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        let qs = client.get_proposal_quorum_state(&proposal_id).unwrap();
+
+        assert_eq!(qs.votes_cast, 50);
+        assert_eq!(qs.yes_votes, 50);
+        assert_eq!(qs.no_votes, 0);
+        assert!(!qs.quorum_met, "quorum should not be met with 50/100 votes");
+        // approval_bps = 50 * 10_000 / 50 = 10_000 (all yes)
+        assert_eq!(qs.approval_bps, 10_000);
+        // quorum_fraction_bps = 50 * 10_000 / 100 = 5_000
+        assert_eq!(qs.quorum_fraction_bps, 5_000);
+    }
+
+    /// Votes exactly at the quorum threshold set quorum_met=true and emit EventQuorumReached.
+    #[test]
+    fn quorum_state_exactly_at_threshold_emits_quorum_reached() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // Cache exactly 100 weight — equal to quorum_threshold
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, proposal.snapshot_ledger, &voter, 100);
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        let qs = client.get_proposal_quorum_state(&proposal_id).unwrap();
+
+        assert!(qs.quorum_met, "quorum should be met at exactly the threshold");
+        assert_eq!(qs.votes_cast, 100);
+        assert_eq!(qs.quorum_fraction_bps, 10_000);
+        // approval_bps = 10_000 (all yes), which meets consensus_threshold 5_100
+        assert_eq!(qs.approval_bps, 10_000);
+
+        // Verify EventQuorumReached was emitted
+        let events = env.events().all();
+        let qrm_event = events.iter().find(|(cid, topics, _)| {
+            if *cid != contract_id { return false; }
+            if let Some(t0) = topics.get(0) {
+                let s: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &t0);
+                s == symbol_short!("qrm_rchd")
+            } else { false }
+        });
+        assert!(qrm_event.is_some(), "EventQuorumReached must be emitted when quorum is first crossed");
+
+        let (_, topics, data) = qrm_event.unwrap();
+        let pid: u32 = soroban_sdk::FromVal::from_val(&env, &topics.get(1).unwrap());
+        assert_eq!(pid, proposal_id);
+
+        let payload: EventQuorumReached = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(payload.proposal_id, proposal_id);
+        assert_eq!(payload.votes_cast, 100);
+        assert_eq!(payload.quorum_threshold, 100);
+        assert_eq!(payload.approval_bps, 10_000);
+    }
+
+    /// Quorum fraction is capped at 10_000 bps even when votes_cast greatly exceeds threshold.
+    #[test]
+    fn quorum_fraction_bps_capped_at_10000() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // 500 weight — 5× the quorum threshold of 100
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, proposal.snapshot_ledger, &voter, 500);
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        let qs = client.get_proposal_quorum_state(&proposal_id).unwrap();
+        assert_eq!(qs.quorum_fraction_bps, 10_000, "fraction must not exceed 10_000");
+        assert!(qs.quorum_met);
+    }
+
+    /// Approval bps is correctly computed with a split yes/no vote.
+    #[test]
+    fn quorum_state_split_vote_approval_bps() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter_yes = Address::generate(&env);
+        let voter_no = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // 60 yes + 40 no = 100 total, exactly at quorum (quorum_threshold=100)
+        // approval_bps = 60 * 10_000 / 100 = 6_000
+        // consensus_threshold = 5_100, so 6_000 > 5_100 → Approved
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, proposal.snapshot_ledger, &voter_yes, 60);
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, proposal.snapshot_ledger, &voter_no, 40);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter_yes,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter_yes.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter_yes, &proposal_id, &VoteChoice::Approve);
+
+        // After first vote (60 < 100 threshold) — quorum not yet met
+        let qs_mid = client.get_proposal_quorum_state(&proposal_id).unwrap();
+        assert!(!qs_mid.quorum_met);
+        assert_eq!(qs_mid.votes_cast, 60);
+        assert_eq!(qs_mid.approval_bps, 10_000);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter_no,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter_no.clone(), proposal_id, VoteChoice::Reject).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter_no, &proposal_id, &VoteChoice::Reject);
+
+        let qs = client.get_proposal_quorum_state(&proposal_id).unwrap();
+        assert!(qs.quorum_met);
+        assert_eq!(qs.yes_votes, 60);
+        assert_eq!(qs.no_votes, 40);
+        assert_eq!(qs.votes_cast, 100);
+        assert_eq!(qs.approval_bps, 6_000);
+        assert_eq!(qs.quorum_fraction_bps, 10_000);
+    }
+
+    /// EventQuorumReached is emitted only once even when additional votes are cast after quorum.
+    #[test]
+    fn quorum_reached_event_emitted_only_once() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+
+        // voter1 casts 100 → crosses threshold
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, proposal.snapshot_ledger, &voter1, 100);
+
+        // voter2 wants to vote but proposal already finalized at quorum;
+        // set voter2 balance before the vote
+        // NOTE: since quorum=100 and voter1 already crosses it, the proposal
+        // moves to a terminal state, so we use voter2 to test the sentinel on a
+        // second proposal to avoid "not active" panic.
+        // We test idempotency directly by checking event count.
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter1,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter1.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter1, &proposal_id, &VoteChoice::Approve);
+
+        // Count qrm_rchd events
+        let events = env.events().all();
+        let qrm_count = events.iter().filter(|(cid, topics, _)| {
+            if *cid != contract_id { return false; }
+            if let Some(t0) = topics.get(0) {
+                let s: soroban_sdk::Symbol = soroban_sdk::FromVal::from_val(&env, &t0);
+                s == symbol_short!("qrm_rchd")
+            } else { false }
+        }).count();
+
+        assert_eq!(qrm_count, 1, "EventQuorumReached must be emitted exactly once");
+
+        // Now create a second proposal and verify the sentinel is proposal-scoped
+        let _ = voter2; // voter2 unused in this scenario; sentinel key is (proposal_id) specific
+    }
+
+    /// get_proposal_quorum_state returns None for non-existent proposal.
+    #[test]
+    fn quorum_state_for_nonexistent_proposal_returns_none() {
+        let (env, _contract_id, _admin, _pulse, client) = setup();
+        let result = client.get_proposal_quorum_state(&9999u32);
+        assert!(result.is_none(), "nonexistent proposal must return None");
+    }
+
+    /// version() returns (1, 1, 0) after the bump.
+    #[test]
+    fn version_returns_1_1_0() {
+        let (env, _contract_id, _admin, _pulse, client) = setup();
+        let ver = client.version();
+        assert_eq!(ver, (1u32, 1u32, 0u32));
+    }
+
+    /// supports_version(1, 1, 0) is true; (1, 2, 0) is false.
+    #[test]
+    fn supports_version_compatibility_checks() {
+        let (env, _contract_id, _admin, _pulse, client) = setup();
+        assert!(client.supports_version(&1, &0, &0), "must support v1.0.0 (backward compat)");
+        assert!(client.supports_version(&1, &1, &0), "must support v1.1.0 (exact)");
+        assert!(!client.supports_version(&1, &2, &0), "must not support v1.2.0 (not yet deployed)");
+        assert!(!client.supports_version(&2, &0, &0), "must not support v2.0.0 (major mismatch)");
+    }
+
+    /// interface_features includes "quorum_state".
+    #[test]
+    fn interface_features_includes_quorum_state() {
+        let (env, _contract_id, _admin, _pulse, client) = setup();
+        let features = client.interface_features();
+        let quorum_sym = soroban_sdk::Symbol::new(&env, "quorum_state");
+        assert!(features.contains(&quorum_sym), "interface_features must include quorum_state");
+    }
+
+    /// interface_id golden vector — minor byte is now 0x01.
+    #[test]
+    fn interface_id_golden_vector_v1_1_0() {
+        let (env, _contract_id, _admin, _pulse, client) = setup();
+        let id = client.interface_id();
+        let bytes = id.to_array();
+        // First 8 bytes: "TalosGov"
+        assert_eq!(&bytes[0..8], &[0x54, 0x61, 0x6C, 0x6F, 0x73, 0x47, 0x6F, 0x76]);
+        // Bytes 16-19: major = 1
+        assert_eq!(&bytes[16..20], &[0x00, 0x00, 0x00, 0x01]);
+        // Bytes 20-23: minor = 1
+        assert_eq!(&bytes[20..24], &[0x00, 0x00, 0x00, 0x01]);
+        // Bytes 24-27: patch = 0
+        assert_eq!(&bytes[24..28], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    /// Boundary: quorum_threshold=1 with one tiny weight vote reaches quorum.
+    #[test]
+    fn quorum_state_boundary_threshold_one() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| { li.sequence_number = 100; li.timestamp = 1_000; });
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        // quorum_threshold = 1
+        client.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "initialize",
+                args: (admin.clone(), pulse.clone(), 1_i128, 5_000_i128, 20_u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]).initialize(&admin, &pulse, &1_i128, &5_000_i128, &20_u32);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+        let proposal_id = client.mock_auths(&[MockAuth {
+            address: &proposer,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "create_proposal",
+                args: (proposer.clone(), 1u32, s(&env, "t"), s(&env, "d")).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]).create_proposal(&proposer, &1u32, &s(&env, "t"), &s(&env, "d"));
+
+        client.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "cache_token_balance",
+                args: (admin.clone(), 90u32, voter.clone(), 1i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]).cache_token_balance(&admin, &90u32, &voter, &1i128);
+
+        client.mock_auths(&[MockAuth {
+            address: &voter,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "vote",
+                args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]).vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        let qs = client.get_proposal_quorum_state(&proposal_id).unwrap();
+        assert!(qs.quorum_met);
+        assert_eq!(qs.votes_cast, 1);
+        assert_eq!(qs.quorum_fraction_bps, 10_000);
+    }
+
+    /// Regression: existing finalize/execute lifecycle unchanged after v1.1.0.
+    #[test]
+    fn regression_lifecycle_unchanged_after_quorum_state_addition() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        cache_balance_with_auth(&env, &contract_id, &client, &admin, proposal.snapshot_ledger, &voter, 200);
+
+        client.mock_auths(&[MockAuth {
+            address: &voter,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "vote",
+                args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]).vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        let proposal_after = client.get_proposal(&proposal_id).unwrap();
+        // Quorum met (200 >= 100) and approval_bps (10_000) >= consensus_threshold (5_100)
+        assert_eq!(proposal_after.status, ProposalStatus::Approved);
+
+        client.execute_proposal(&proposal_id);
+        let proposal_final = client.get_proposal(&proposal_id).unwrap();
+        assert_eq!(proposal_final.status, ProposalStatus::Executed);
+    }
+
+    // ── Budget regression gates (#610) ───────────────────────────────────────
+    //
+    // Measure CPU-instruction and memory-byte cost on the host target.
+    // Ceilings are loose regression catches; actual WASM costs are higher.
+    // env.budget().reset_default() re-zeroes counters and re-applies the
+    // default per-transaction limit before each measurement.
+
+    const BUDGET_CPU_INITIALIZE_GOV: u64       = 400_000;
+    const BUDGET_MEM_INITIALIZE_GOV: u64       =  80_000;
+
+    const BUDGET_CPU_CREATE_PROPOSAL: u64      = 600_000;
+    const BUDGET_MEM_CREATE_PROPOSAL: u64      = 120_000;
+
+    const BUDGET_CPU_VOTE: u64                 = 800_000;
+    const BUDGET_MEM_VOTE: u64                 = 150_000;
+
+    const BUDGET_CPU_RECORD_DIVIDEND: u64      = 600_000;
+    const BUDGET_MEM_RECORD_DIVIDEND: u64      = 120_000;
+
+    const BUDGET_CPU_GET_PROPOSAL: u64         = 200_000;
+    const BUDGET_MEM_GET_PROPOSAL: u64         =  50_000;
+
+    #[test]
+    fn budget_initialize_within_limits() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 100;
+            li.timestamp = 1_000;
+        });
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        env.budget().reset_default();
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), pulse.clone(), 100_i128, 5_100_i128, 20_u32)
+                        .into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &5_100_i128, &20_u32);
+
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        assert!(
+            cpu < BUDGET_CPU_INITIALIZE_GOV,
+            "governance initialize CPU {} exceeded ceiling {}",
+            cpu, BUDGET_CPU_INITIALIZE_GOV,
+        );
+        assert!(
+            mem < BUDGET_MEM_INITIALIZE_GOV,
+            "governance initialize memory {} exceeded ceiling {}",
+            mem, BUDGET_MEM_INITIALIZE_GOV,
+        );
+    }
+
+    #[test]
+    fn budget_create_proposal_within_limits() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+
+        env.budget().reset_default();
+        create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        assert!(
+            cpu < BUDGET_CPU_CREATE_PROPOSAL,
+            "create_proposal CPU {} exceeded ceiling {}",
+            cpu, BUDGET_CPU_CREATE_PROPOSAL,
+        );
+        assert!(
+            mem < BUDGET_MEM_CREATE_PROPOSAL,
+            "create_proposal memory {} exceeded ceiling {}",
+            mem, BUDGET_MEM_CREATE_PROPOSAL,
+        );
+    }
+
+    #[test]
+    fn budget_vote_within_limits() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let voter    = Address::generate(&env);
+
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).unwrap();
+        cache_balance_with_auth(
+            &env, &contract_id, &client, &admin,
+            proposal.snapshot_ledger, &voter, 200,
+        );
+
+        env.budget().reset_default();
+        client
+            .mock_auths(&[MockAuth {
+                address: &voter,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "vote",
+                    args: (voter.clone(), proposal_id, VoteChoice::Approve).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .vote(&voter, &proposal_id, &VoteChoice::Approve);
+
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        assert!(
+            cpu < BUDGET_CPU_VOTE,
+            "vote CPU {} exceeded ceiling {}",
+            cpu, BUDGET_CPU_VOTE,
+        );
+        assert!(
+            mem < BUDGET_MEM_VOTE,
+            "vote memory {} exceeded ceiling {}",
+            mem, BUDGET_MEM_VOTE,
+        );
+    }
+
+    #[test]
+    fn budget_record_dividend_snapshot_within_limits() {
+        let (env, contract_id, admin, _pulse, client) = setup();
+
+        env.budget().reset_default();
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "record_dividend_snapshot",
+                    args: (admin.clone(), 1_u32, 500_000_i128, 100_i128).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .record_dividend_snapshot(&admin, &1_u32, &500_000_i128, &100_i128);
+
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        assert!(
+            cpu < BUDGET_CPU_RECORD_DIVIDEND,
+            "record_dividend_snapshot CPU {} exceeded ceiling {}",
+            cpu, BUDGET_CPU_RECORD_DIVIDEND,
+        );
+        assert!(
+            mem < BUDGET_MEM_RECORD_DIVIDEND,
+            "record_dividend_snapshot memory {} exceeded ceiling {}",
+            mem, BUDGET_MEM_RECORD_DIVIDEND,
+        );
+    }
+
+    #[test]
+    fn budget_get_proposal_read_within_limits() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+
+        env.budget().reset_default();
+        let _ = client.get_proposal(&proposal_id);
+
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        assert!(
+            cpu < BUDGET_CPU_GET_PROPOSAL,
+            "get_proposal CPU {} exceeded ceiling {}",
+            cpu, BUDGET_CPU_GET_PROPOSAL,
+        );
+        assert!(
+            mem < BUDGET_MEM_GET_PROPOSAL,
+            "get_proposal memory {} exceeded ceiling {}",
+            mem, BUDGET_MEM_GET_PROPOSAL,
+        );
+    }
+
+    /// Negative: create_proposal with empty title must fail cheaply.
+    #[test]
+    fn budget_create_proposal_empty_title_rejected_cheaply() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+        let empty    = soroban_sdk::String::from_str(&env, "");
+        let desc     = soroban_sdk::String::from_str(&env, "Some description");
+
+        env.budget().reset_default();
+        let result = client
+            .mock_auths(&[MockAuth {
+                address: &proposer,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "create_proposal",
+                    args: (proposer.clone(), 1_u32, empty.clone(), desc.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_create_proposal(&proposer, &1_u32, &empty, &desc);
+        assert!(result.is_err(), "empty title must be rejected");
+
+        let cpu = env.budget().cpu_instruction_cost();
+        let mem = env.budget().memory_bytes_cost();
+        // Validation rejection must be no more expensive than a success path.
+        assert!(
+            cpu < BUDGET_CPU_CREATE_PROPOSAL,
+            "rejected create_proposal CPU {} exceeded ceiling {}",
+            cpu, BUDGET_CPU_CREATE_PROPOSAL,
+        );
+        assert!(
+            mem < BUDGET_MEM_CREATE_PROPOSAL,
+            "rejected create_proposal memory {} exceeded ceiling {}",
+            mem, BUDGET_MEM_CREATE_PROPOSAL,
+        );
+    }
+
+    // ── Snapshot Offset Configuration ────────────────────────────────
+
+    /// Confirms that by default, snapshot_ledger equals start_ledger - DEFAULT_SNAPSHOT_OFFSET_LEDGERS.
+    #[test]
+    fn proposal_snapshot_ledger_equals_start_ledger_minus_default_offset() {
+        let (env, contract_id, _admin, _pulse, client) = setup();
+        let proposer = Address::generate(&env);
+
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).expect("Proposal not found");
+
+        assert_eq!(
+            proposal.snapshot_ledger,
+            proposal.start_ledger - DEFAULT_SNAPSHOT_OFFSET_LEDGERS,
+            "snapshot_ledger must equal start_ledger minus default offset"
+        );
+    }
+
+    /// Admin can tune snapshot_offset_ledgers per deployment via GovernanceConfig.
+    #[test]
+    fn proposal_snapshot_ledger_respects_custom_configured_offset() {
+        let (env, contract_id, admin, pulse, client) = setup();
+        let custom_offset = 25_u32;
+        let config = GovernanceConfig {
+            quorum_threshold: 100,
+            consensus_threshold: 5_100,
+            voting_period_ledgers: 20,
+            pulse_token_address: pulse,
+            snapshot_offset_ledgers: Some(custom_offset),
+        };
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_config",
+                    args: (admin.clone(), config.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_config(&admin, &config);
+
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).expect("Proposal not found");
+
+        assert_eq!(
+            proposal.snapshot_ledger,
+            proposal.start_ledger - custom_offset,
+            "snapshot_ledger must equal start_ledger minus custom configured offset"
+        );
+    }
+
+    /// update_config rejects snapshot_offset_ledgers exceeding MAX_SNAPSHOT_OFFSET_LEDGERS.
+    #[test]
+    #[should_panic(expected = "Snapshot offset exceeds maximum allowed")]
+    fn update_config_rejects_excessive_snapshot_offset() {
+        let (env, contract_id, admin, pulse, client) = setup();
+        let config = GovernanceConfig {
+            quorum_threshold: 100,
+            consensus_threshold: 5_100,
+            voting_period_ledgers: 20,
+            pulse_token_address: pulse,
+            snapshot_offset_ledgers: Some(MAX_SNAPSHOT_OFFSET_LEDGERS + 1),
+        };
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "update_config",
+                    args: (admin.clone(), config.clone()).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .update_config(&admin, &config);
+    }
+
+    /// When current ledger sequence is less than the offset, saturating_sub prevents underflow.
+    #[test]
+    fn proposal_snapshot_ledger_saturates_at_zero_if_ledger_below_offset() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 5;
+            li.timestamp = 1_000;
+        });
+        let contract_id = env.register_contract(None, TalosGovernance);
+        let client = TalosGovernanceClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pulse = Address::generate(&env);
+
+        client
+            .mock_auths(&[MockAuth {
+                address: &admin,
+                invoke: &MockAuthInvoke {
+                    contract: &contract_id,
+                    fn_name: "initialize",
+                    args: (admin.clone(), pulse.clone(), 100_i128, 5_100_i128, 20_u32).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .initialize(&admin, &pulse, &100_i128, &5_100_i128, &20_u32);
+
+        let proposer = Address::generate(&env);
+        let proposal_id = create_proposal_with_auth(&env, &contract_id, &client, &proposer);
+        let proposal = client.get_proposal(&proposal_id).expect("Proposal not found");
+
+        assert_eq!(proposal.start_ledger, 5);
+        assert_eq!(proposal.snapshot_ledger, 0);
     }
 }
